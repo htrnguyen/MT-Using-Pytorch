@@ -2,13 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-Script chính để chạy huấn luyện và đánh giá mô hình dịch máy Tiếng Việt - Tiếng Anh
+Script chính để chạy mô hình dịch máy Tiếng Việt - Tiếng Anh trên Kaggle
 """
 
 import os
 import argparse
-import torch
 import logging
+import torch
+import shutil
+import pickle
+import pandas as pd
+from data_preprocessing import DataPreprocessor
+from train import train_transformer, train_lstm, compare_models
+from evaluate import evaluate_and_compare
 
 # Thiết lập logging
 logging.basicConfig(
@@ -19,46 +25,193 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def prepare_data(config):
+    """
+    Chuẩn bị dữ liệu từ dataset vào thư mục làm việc
+    
+    Args:
+        config (dict): Cấu hình
+    """
+    # Tạo thư mục
+    os.makedirs(config['data_dir'], exist_ok=True)
+    
+    # Kiểm tra xem file dữ liệu đã tồn tại trong thư mục data chưa
+    eng_vie_csv = os.path.join(config['data_dir'], 'eng_vie.csv')
+    vie_txt = os.path.join(config['data_dir'], 'vie.txt')
+    
+    # Nếu chưa tồn tại, sao chép từ dataset
+    if not os.path.exists(eng_vie_csv):
+        # Đường dẫn file trong dataset
+        dataset_eng_vie_csv = './data/eng_vie.csv'
+        
+        if os.path.exists(dataset_eng_vie_csv):
+            shutil.copy(dataset_eng_vie_csv, eng_vie_csv)
+            logger.info(f"Đã sao chép {dataset_eng_vie_csv} vào {eng_vie_csv}")
+        else:
+            logger.error(f"Không tìm thấy file {dataset_eng_vie_csv}")
+            return False
+    
+    if not os.path.exists(vie_txt):
+        # Đường dẫn file trong dataset
+        dataset_vie_txt = './data/vie.txt'
+        
+        if os.path.exists(dataset_vie_txt):
+            shutil.copy(dataset_vie_txt, vie_txt)
+            logger.info(f"Đã sao chép {dataset_vie_txt} vào {vie_txt}")
+        else:
+            logger.error(f"Không tìm thấy file {dataset_vie_txt}")
+            return False
+    
+    logger.info("Dữ liệu đã được chuẩn bị thành công")
+    return True
+
+
+def process_data(config):
+    """
+    Xử lý dữ liệu
+    
+    Args:
+        config (dict): Cấu hình
+    
+    Returns:
+        bool: Thành công hay không
+    """
+    # Kiểm tra xem file dữ liệu đã tồn tại chưa
+    eng_vie_csv = os.path.join(config['data_dir'], 'eng_vie.csv')
+    vie_txt = os.path.join(config['data_dir'], 'vie.txt')
+    
+    if not os.path.exists(eng_vie_csv) or not os.path.exists(vie_txt):
+        logger.error(f"Không tìm thấy file dữ liệu. Vui lòng chạy lệnh với --prepare_data trước.")
+        return False
+    
+    # Tạo đối tượng DataPreprocessor
+    data_preprocessor = DataPreprocessor(config)
+    
+    # Xử lý dữ liệu
+    try:
+        train_data, val_data, test_data, en_sp, vi_sp = data_preprocessor.process(eng_vie_csv, vie_txt)
+        logger.info("Đã xử lý dữ liệu thành công")
+        return True
+    except Exception as e:
+        logger.error(f"Lỗi khi xử lý dữ liệu: {e}")
+        return False
+
+
+def train_models(config, model_type=None):
+    """
+    Huấn luyện mô hình
+    
+    Args:
+        config (dict): Cấu hình
+        model_type (str, optional): Loại mô hình ('transformer', 'lstm' hoặc None cho cả hai)
+    
+    Returns:
+        bool: Thành công hay không
+    """
+    # Kiểm tra xem tokenizer đã tồn tại chưa
+    tokenizers_path = os.path.join(config['model_dir'], 'tokenizers.pkl')
+    
+    if not os.path.exists(tokenizers_path):
+        logger.error(f"Không tìm thấy tokenizer. Vui lòng xử lý dữ liệu trước.")
+        return False
+    
+    # Huấn luyện mô hình
+    try:
+        transformer_history = None
+        lstm_history = None
+        
+        if model_type is None or model_type == 'transformer':
+            logger.info("Bắt đầu huấn luyện mô hình Transformer...")
+            _, transformer_history = train_transformer(config)
+        
+        if model_type is None or model_type == 'lstm':
+            logger.info("Bắt đầu huấn luyện mô hình LSTM...")
+            _, lstm_history = train_lstm(config)
+        
+        # So sánh hai mô hình nếu cả hai đều được huấn luyện
+        if transformer_history is not None and lstm_history is not None:
+            compare_models(transformer_history, lstm_history, config)
+        
+        logger.info("Đã huấn luyện mô hình thành công")
+        return True
+    except Exception as e:
+        logger.error(f"Lỗi khi huấn luyện mô hình: {e}")
+        return False
+
+
+def evaluate_models(config):
+    """
+    Đánh giá mô hình
+    
+    Args:
+        config (dict): Cấu hình
+    
+    Returns:
+        bool: Thành công hay không
+    """
+    # Kiểm tra xem mô hình đã tồn tại chưa
+    transformer_path = os.path.join(config['model_dir'], 'transformer_best.pt')
+    lstm_path = os.path.join(config['model_dir'], 'lstm_best.pt')
+    
+    if not os.path.exists(transformer_path) and not os.path.exists(lstm_path):
+        logger.error(f"Không tìm thấy mô hình. Vui lòng huấn luyện mô hình trước.")
+        return False
+    
+    # Đánh giá mô hình
+    try:
+        transformer_bleu, lstm_bleu = evaluate_and_compare(config)
+        
+        # Kết luận
+        if transformer_bleu > lstm_bleu:
+            logger.info("\nKết luận: Mô hình Transformer có hiệu suất tốt hơn!")
+        elif lstm_bleu > transformer_bleu:
+            logger.info("\nKết luận: Mô hình LSTM có hiệu suất tốt hơn!")
+        else:
+            logger.info("\nKết luận: Hai mô hình có hiệu suất tương đương nhau.")
+        
+        logger.info("Đã đánh giá mô hình thành công")
+        return True
+    except Exception as e:
+        logger.error(f"Lỗi khi đánh giá mô hình: {e}")
+        return False
+
+
 def main():
     """
-    Hàm chính để chạy huấn luyện và đánh giá mô hình
+    Hàm chính
     """
     # Parse arguments
-    parser = argparse.ArgumentParser(description='Huấn luyện và đánh giá mô hình dịch máy Tiếng Việt - Tiếng Anh')
-    parser.add_argument('--mode', type=str, choices=['preprocess', 'train', 'evaluate', 'all'], default='all',
-                        help='Chế độ chạy: preprocess, train, evaluate hoặc all')
-    parser.add_argument('--data_dir', type=str, default='/kaggle/working/data', help='Thư mục dữ liệu')
-    parser.add_argument('--model_dir', type=str, default='/kaggle/working/models', help='Thư mục mô hình')
-    parser.add_argument('--src_lang', type=str, default='en', help='Ngôn ngữ nguồn')
-    parser.add_argument('--tgt_lang', type=str, default='vi', help='Ngôn ngữ đích')
-    parser.add_argument('--batch_size', type=int, default=32, help='Kích thước batch')
-    parser.add_argument('--epochs', type=int, default=20, help='Số epoch')
-    parser.add_argument('--model_type', type=str, choices=['transformer', 'lstm', 'both'], default='both',
-                        help='Loại mô hình: transformer, lstm hoặc both')
-    parser.add_argument('--vocab_size', type=int, default=8000, help='Kích thước từ điển')
+    parser = argparse.ArgumentParser(description='Mô hình dịch máy Tiếng Việt - Tiếng Anh')
+    parser.add_argument('--mode', type=str, default='all', choices=['all', 'prepare', 'process', 'train', 'evaluate'],
+                        help='Chế độ chạy (all, prepare, process, train, evaluate)')
+    parser.add_argument('--model_type', type=str, default=None, choices=['transformer', 'lstm'],
+                        help='Loại mô hình (transformer, lstm hoặc None cho cả hai)')
+    parser.add_argument('--data_dir', type=str, default='./data', help='Thư mục dữ liệu')
+    parser.add_argument('--model_dir', type=str, default='./models', help='Thư mục mô hình')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
-                        help='Thiết bị (CPU/GPU)')
-    parser.add_argument('--num_workers', type=int, default=2, help='Số worker cho DataLoader')
-    parser.add_argument('--mixed_precision', action='store_true', help='Sử dụng mixed precision')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='Số bước tích lũy gradient')
+                        help='Thiết bị (cuda, cpu)')
+    parser.add_argument('--prepare_data', action='store_true', help='Chuẩn bị dữ liệu từ dataset')
     args = parser.parse_args()
-    
-    # Tạo thư mục
-    os.makedirs(args.data_dir, exist_ok=True)
-    os.makedirs(args.model_dir, exist_ok=True)
     
     # Cấu hình
     config = {
         'data_dir': args.data_dir,
         'model_dir': args.model_dir,
-        'src_lang': args.src_lang,
-        'tgt_lang': args.tgt_lang,
-        'batch_size': args.batch_size,
+        'src_lang': 'en',
+        'tgt_lang': 'vi',
+        'batch_size': 32,
         'max_len': 128,
-        'num_workers': args.num_workers,
+        'num_workers': 2,
         'device': args.device,
-        'mixed_precision': args.mixed_precision,
-        'gradient_accumulation_steps': args.gradient_accumulation_steps,
+        'mixed_precision': True,
+        'gradient_accumulation_steps': 4,
+        'min_sentence_length': 3,
+        'max_sentence_length': 100,
+        'length_ratio_threshold': 2.5,
+        'vocab_size': 8000,
+        'tokenizer_type': 'bpe',
+        'val_test_size': 0.2,
+        'random_seed': 42,
         
         'transformer': {
             'd_model': 512,
@@ -73,7 +226,7 @@ def main():
             'lr_factor': 2.0,
             'warmup_steps': 4000,
             'clip_grad': 1.0,
-            'epochs': args.epochs,
+            'epochs': 20,
             'patience': 5
         },
         
@@ -87,92 +240,43 @@ def main():
             'pad_idx': 0,
             'learning_rate': 0.001,
             'clip_grad': 1.0,
-            'epochs': args.epochs,
+            'epochs': 20,
             'patience': 5
         }
     }
     
-    # Tiền xử lý dữ liệu
-    if args.mode in ['preprocess', 'all']:
-        logger.info("Bắt đầu tiền xử lý dữ liệu...")
-        from data_preprocessing import DataPreprocessor
-        
-        preprocessor_config = {
-            'data_dir': args.data_dir,
-            'model_dir': args.model_dir,
-            'vocab_size': args.vocab_size,
-            'tokenizer_type': 'bpe',
-            'min_sentence_length': 3,
-            'max_sentence_length': 100,
-            'length_ratio_threshold': 2.5,
-            'val_test_size': 0.2,
-            'random_seed': 42,
-            'src_lang': args.src_lang,
-            'tgt_lang': args.tgt_lang,
-            'batch_size': args.batch_size,
-            'max_len': 128,
-            'num_workers': args.num_workers
-        }
-        
-        preprocessor = DataPreprocessor(preprocessor_config)
-        
-        # Đường dẫn file dữ liệu
-        file1_path = '/kaggle/input/eng-viet/eng_vie.csv'
-        file2_path = '/kaggle/input/eng-viet/vie.txt'
-        
-        # Tiền xử lý dữ liệu
-        train_data, val_data, test_data, en_sp, vi_sp = preprocessor.process(file1_path, file2_path)
-        logger.info("Hoàn thành tiền xử lý dữ liệu!")
+    # Tạo thư mục
+    os.makedirs(config['data_dir'], exist_ok=True)
+    os.makedirs(config['model_dir'], exist_ok=True)
     
-    # Huấn luyện mô hình
-    if args.mode in ['train', 'all']:
-        logger.info("Bắt đầu huấn luyện mô hình...")
-        from train import train_transformer, train_lstm
-        
-        # Huấn luyện mô hình Transformer
-        if args.model_type in ['transformer', 'both']:
-            logger.info("Huấn luyện mô hình Transformer...")
-            transformer_model, transformer_history = train_transformer(config)
-        
-        # Huấn luyện mô hình LSTM
-        if args.model_type in ['lstm', 'both']:
-            logger.info("Huấn luyện mô hình LSTM...")
-            lstm_model, lstm_history = train_lstm(config)
-        
-        # So sánh mô hình
-        if args.model_type == 'both':
-            from train import compare_models
-            compare_models(transformer_history, lstm_history, config)
-        
-        logger.info("Hoàn thành huấn luyện mô hình!")
+    # Chuẩn bị dữ liệu nếu cần
+    if args.prepare_data:
+        logger.info("Chuẩn bị dữ liệu từ dataset...")
+        if not prepare_data(config):
+            return
     
-    # Đánh giá mô hình
-    if args.mode in ['evaluate', 'all']:
-        logger.info("Bắt đầu đánh giá mô hình...")
-        from evaluate import main as evaluate_main
-        
-        # Cấu hình đánh giá
-        eval_config = {
-            'data_dir': args.data_dir,
-            'model_dir': args.model_dir,
-            'num_samples': 100,
-            'device': args.device,
-            'src_lang': args.src_lang,
-            'tgt_lang': args.tgt_lang,
-            
-            'transformer': config['transformer'],
-            'lstm': config['lstm']
-        }
-        
-        # Đánh giá mô hình
-        best_model, transformer_bleu, lstm_bleu = evaluate_main(eval_config)
-        logger.info(f"Mô hình tốt nhất: {best_model}")
-        logger.info(f"BLEU score của mô hình Transformer: {transformer_bleu:.2f}")
-        logger.info(f"BLEU score của mô hình LSTM: {lstm_bleu:.2f}")
-        
-        logger.info("Hoàn thành đánh giá mô hình!")
+    # Chạy theo chế độ
+    if args.mode == 'all' or args.mode == 'prepare':
+        logger.info("Chuẩn bị dữ liệu từ dataset...")
+        if not prepare_data(config):
+            return
     
-    logger.info("Hoàn thành tất cả các bước!")
+    if args.mode == 'all' or args.mode == 'process':
+        logger.info("Xử lý dữ liệu...")
+        if not process_data(config):
+            return
+    
+    if args.mode == 'all' or args.mode == 'train':
+        logger.info("Huấn luyện mô hình...")
+        if not train_models(config, args.model_type):
+            return
+    
+    if args.mode == 'all' or args.mode == 'evaluate':
+        logger.info("Đánh giá mô hình...")
+        if not evaluate_models(config):
+            return
+    
+    logger.info("Hoàn thành!")
 
 
 if __name__ == "__main__":

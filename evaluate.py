@@ -2,24 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-Đánh giá và so sánh mô hình dịch máy Tiếng Việt - Tiếng Anh
+Đánh giá mô hình dịch máy Tiếng Việt - Tiếng Anh
 """
 
 import os
-import torch
 import logging
+import torch
 import pickle
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import sacrebleu
 from tqdm import tqdm
-import argparse
-import numpy as np
-from tabulate import tabulate
 
 # Import các module đã tạo
-from transformer_model import TransformerModel, translate as transformer_translate
+from data_preprocessing import create_dataloaders
+from transformer_model import translate as transformer_translate
 from lstm_model import LSTMSeq2Seq
 
 # Thiết lập logging
@@ -31,30 +30,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_model(model_path, model_type, config, device):
+def load_model(model_path, model_type, config, src_vocab_size, tgt_vocab_size):
     """
-    Tải mô hình đã huấn luyện
+    Tải mô hình từ file
     
     Args:
         model_path (str): Đường dẫn đến file mô hình
         model_type (str): Loại mô hình ('transformer' hoặc 'lstm')
         config (dict): Cấu hình mô hình
-        device (str): Thiết bị (CPU/GPU)
-        
+        src_vocab_size (int): Kích thước từ điển nguồn
+        tgt_vocab_size (int): Kích thước từ điển đích
+    
     Returns:
         model: Mô hình đã tải
     """
-    # Tải tokenizer
-    with open(os.path.join(config['model_dir'], 'tokenizers.pkl'), 'rb') as f:
-        tokenizers = pickle.load(f)
-    
-    en_sp = tokenizers['en_sp']
-    vi_sp = tokenizers['vi_sp']
-    
-    # Xác định kích thước từ điển
-    src_vocab_size = en_sp.get_piece_size() if config['src_lang'] == 'en' else vi_sp.get_piece_size()
-    tgt_vocab_size = vi_sp.get_piece_size() if config['tgt_lang'] == 'vi' else en_sp.get_piece_size()
-    
     # Tạo mô hình
     if model_type == 'transformer':
         from transformer_model import create_transformer_model
@@ -64,381 +53,251 @@ def load_model(model_path, model_type, config, device):
         model = create_lstm_model(config['lstm'], src_vocab_size, tgt_vocab_size)
     
     # Tải trọng số
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=torch.device(config['device']))
     model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
+    
+    # Chuyển sang thiết bị
+    model = model.to(config['device'])
+    
+    # Chuyển sang chế độ đánh giá
     model.eval()
     
-    logger.info(f"Đã tải mô hình {model_type} từ {model_path}")
-    
-    return model, en_sp, vi_sp
+    return model
 
 
-def translate_sentence(sentence, model, src_sp, tgt_sp, model_type, device, max_len=100):
+def calculate_bleu(references, hypotheses):
     """
-    Dịch một câu
+    Tính điểm BLEU
     
     Args:
-        sentence (str): Câu cần dịch
-        model: Mô hình dịch
-        src_sp: Tokenizer nguồn
-        tgt_sp: Tokenizer đích
-        model_type (str): Loại mô hình ('transformer' hoặc 'lstm')
-        device (str): Thiết bị (CPU/GPU)
-        max_len (int): Độ dài tối đa của câu dịch
-        
-    Returns:
-        str: Câu đã dịch
-    """
-    model.eval()
+        references (list): Danh sách các câu tham chiếu
+        hypotheses (list): Danh sách các câu dự đoán
     
-    with torch.no_grad():
-        if model_type == 'transformer':
-            # Tokenize câu nguồn
-            src_tokens = [src_sp.bos_id()] + src_sp.encode(sentence, out_type=int) + [src_sp.eos_id()]
-            src_tensor = torch.tensor(src_tokens).unsqueeze(0).to(device)
-            src_mask = (src_tensor != 0).unsqueeze(1).unsqueeze(2).to(device)
-            
-            # Encoder
-            enc_output = model.encoder(src_tensor, src_mask)
-            
-            # Bắt đầu với token BOS
-            tgt_tokens = [tgt_sp.bos_id()]
-            tgt_tensor = torch.tensor([tgt_tokens]).to(device)
-            
-            # Dịch từng token
-            for _ in range(max_len):
-                tgt_mask = model.make_tgt_mask(tgt_tensor)
-                output = model.decoder(tgt_tensor, enc_output, tgt_mask, src_mask)
-                output = model.generator(output)
-                
-                # Lấy token có xác suất cao nhất
-                pred_token = output.argmax(2)[:, -1].item()
-                tgt_tokens.append(pred_token)
-                tgt_tensor = torch.tensor([tgt_tokens]).to(device)
-                
-                # Dừng nếu gặp token EOS
-                if pred_token == tgt_sp.eos_id():
-                    break
-            
-            # Chuyển từ tokens sang câu
-            pred_tokens = tgt_tokens[1:]  # Bỏ token BOS
-            if pred_tokens[-1] == tgt_sp.eos_id():
-                pred_tokens = pred_tokens[:-1]  # Bỏ token EOS
-            
-            return tgt_sp.decode(pred_tokens)
-        
-        elif model_type == 'lstm':
-            # Tokenize câu nguồn
-            src_tokens = [src_sp.bos_id()] + src_sp.encode(sentence, out_type=int) + [src_sp.eos_id()]
-            src_tensor = torch.tensor(src_tokens).unsqueeze(0).to(device)
-            src_lengths = torch.tensor([len(src_tokens)]).to(device)
-            
-            # Dịch câu
-            translations, _ = model.translate(src_tensor, src_lengths, tgt_sp, max_len, device)
-            
-            return translations[0]
+    Returns:
+        float: Điểm BLEU
+    """
+    # Tính điểm BLEU
+    bleu = sacrebleu.corpus_bleu(hypotheses, [references])
+    
+    return bleu.score
 
 
-def evaluate_on_test_set(model, test_data, src_sp, tgt_sp, model_type, device, max_len=100, num_samples=100):
+def evaluate_model(model, test_loader, tokenizers, config, model_type='transformer', num_samples=100):
     """
     Đánh giá mô hình trên tập test
     
     Args:
-        model: Mô hình dịch
-        test_data (pd.DataFrame): Dữ liệu test
-        src_sp: Tokenizer nguồn
-        tgt_sp: Tokenizer đích
+        model: Mô hình cần đánh giá
+        test_loader: DataLoader cho tập test
+        tokenizers (dict): Các tokenizer
+        config (dict): Cấu hình
         model_type (str): Loại mô hình ('transformer' hoặc 'lstm')
-        device (str): Thiết bị (CPU/GPU)
-        max_len (int): Độ dài tối đa của câu dịch
         num_samples (int): Số lượng mẫu để đánh giá
-        
+    
     Returns:
-        tuple: (bleu_score, hypotheses, references, src_sentences)
+        tuple: (bleu_score, examples) - Điểm BLEU và các ví dụ
     """
-    model.eval()
+    # Xác định tokenizer
+    src_sp = tokenizers['en_sp'] if config['src_lang'] == 'en' else tokenizers['vi_sp']
+    tgt_sp = tokenizers['vi_sp'] if config['tgt_lang'] == 'vi' else tokenizers['en_sp']
     
-    # Lấy mẫu ngẫu nhiên từ tập test
-    if len(test_data) > num_samples:
-        test_samples = test_data.sample(num_samples, random_state=42)
-    else:
-        test_samples = test_data
-    
-    # Xác định cột dữ liệu
-    src_col = 'en_normalized' if model_type == 'transformer' else 'en_normalized'
-    tgt_col = 'vi_normalized' if model_type == 'transformer' else 'vi_normalized'
-    
-    hypotheses = []
+    # Danh sách lưu kết quả
     references = []
-    src_sentences = []
+    hypotheses = []
+    examples = []
     
-    for _, row in tqdm(test_samples.iterrows(), total=len(test_samples), desc=f"Đánh giá mô hình {model_type}"):
-        src_sentence = row[src_col]
-        tgt_sentence = row[tgt_col]
+    # Đánh giá từng batch
+    for i, (src, tgt, src_lengths, tgt_lengths) in enumerate(tqdm(test_loader, desc="Evaluating")):
+        # Chỉ đánh giá một số lượng mẫu nhất định
+        if i * test_loader.batch_size >= num_samples:
+            break
+        
+        # Chuyển dữ liệu sang thiết bị
+        src = src.to(config['device'])
+        tgt = tgt.to(config['device'])
+        src_lengths = src_lengths.to(config['device'])
         
         # Dịch câu
-        translation = translate_sentence(
-            src_sentence, model, src_sp, tgt_sp, model_type, device, max_len
-        )
+        with torch.no_grad():
+            if model_type == 'transformer':
+                # Dịch từng câu trong batch
+                batch_translations = []
+                for j in range(src.size(0)):
+                    translation = transformer_translate(
+                        model, 
+                        src_sp.decode(src[j].cpu().numpy().tolist()), 
+                        src_sp, 
+                        tgt_sp, 
+                        config['device']
+                    )
+                    batch_translations.append(translation)
+            else:
+                # LSTM model
+                batch_translations, _ = model.translate(src, src_lengths, tgt_sp, device=config['device'])
         
-        hypotheses.append(translation)
-        references.append([tgt_sentence])
-        src_sentences.append(src_sentence)
+        # Lấy câu tham chiếu
+        batch_references = []
+        for j in range(tgt.size(0)):
+            # Bỏ qua token BOS, EOS và PAD
+            tgt_tokens = tgt[j].cpu().numpy().tolist()
+            tgt_tokens = [t for t in tgt_tokens if t > 3]  # Bỏ qua PAD, UNK, BOS, EOS
+            reference = tgt_sp.decode(tgt_tokens)
+            batch_references.append(reference)
+        
+        # Thêm vào danh sách kết quả
+        references.extend(batch_references)
+        hypotheses.extend(batch_translations)
+        
+        # Lưu một số ví dụ
+        for j in range(min(3, len(batch_translations))):
+            if len(examples) < 10:  # Chỉ lưu 10 ví dụ
+                src_text = src_sp.decode([t for t in src[j].cpu().numpy().tolist() if t > 3])
+                examples.append({
+                    'source': src_text,
+                    'reference': batch_references[j],
+                    'translation': batch_translations[j]
+                })
     
-    # Tính BLEU score
-    bleu = sacrebleu.corpus_bleu(hypotheses, references)
+    # Tính điểm BLEU
+    bleu_score = calculate_bleu(references, hypotheses)
     
-    return bleu.score, hypotheses, references, src_sentences
+    return bleu_score, examples
 
 
-def compare_translations(src_sentences, transformer_translations, lstm_translations, references, output_path=None):
+def compare_translations(transformer_examples, lstm_examples, config):
     """
     So sánh kết quả dịch của hai mô hình
     
     Args:
-        src_sentences (list): Danh sách câu nguồn
-        transformer_translations (list): Danh sách câu dịch bởi Transformer
-        lstm_translations (list): Danh sách câu dịch bởi LSTM
-        references (list): Danh sách câu tham chiếu
-        output_path (str, optional): Đường dẫn để lưu kết quả
+        transformer_examples (list): Các ví dụ dịch của Transformer
+        lstm_examples (list): Các ví dụ dịch của LSTM
+        config (dict): Cấu hình
     """
-    # Tạo DataFrame
-    comparison_df = pd.DataFrame({
-        'Source': src_sentences,
-        'Reference': [ref[0] for ref in references],
-        'Transformer': transformer_translations,
-        'LSTM': lstm_translations
-    })
+    # Tạo DataFrame so sánh
+    comparison = []
     
-    # Tính BLEU score cho từng câu
-    transformer_bleu = []
-    lstm_bleu = []
+    for i in range(min(len(transformer_examples), len(lstm_examples))):
+        comparison.append({
+            'Source': transformer_examples[i]['source'],
+            'Reference': transformer_examples[i]['reference'],
+            'Transformer': transformer_examples[i]['translation'],
+            'LSTM': lstm_examples[i]['translation']
+        })
     
-    for i in range(len(src_sentences)):
-        transformer_bleu.append(sacrebleu.sentence_bleu(transformer_translations[i], [references[i][0]]).score)
-        lstm_bleu.append(sacrebleu.sentence_bleu(lstm_translations[i], [references[i][0]]).score)
+    comparison_df = pd.DataFrame(comparison)
     
-    comparison_df['Transformer BLEU'] = transformer_bleu
-    comparison_df['LSTM BLEU'] = lstm_bleu
-    comparison_df['Better Model'] = comparison_df.apply(
-        lambda row: 'Transformer' if row['Transformer BLEU'] > row['LSTM BLEU'] else 
-                   ('LSTM' if row['LSTM BLEU'] > row['Transformer BLEU'] else 'Equal'),
-        axis=1
-    )
+    # Lưu DataFrame
+    comparison_df.to_csv(os.path.join(config['model_dir'], "translation_comparison.csv"), index=False)
     
-    # Lưu kết quả
-    if output_path:
-        comparison_df.to_csv(output_path, index=False)
-        logger.info(f"Đã lưu kết quả so sánh tại {output_path}")
-    
-    # Thống kê
-    model_counts = comparison_df['Better Model'].value_counts()
-    logger.info("\nThống kê mô hình tốt hơn:")
-    for model, count in model_counts.items():
-        logger.info(f"{model}: {count} câu ({count/len(comparison_df)*100:.2f}%)")
-    
-    return comparison_df
+    # In một số ví dụ
+    logger.info("\nSo sánh kết quả dịch của hai mô hình:")
+    for i, row in comparison_df.head(3).iterrows():
+        logger.info(f"\nVí dụ {i+1}:")
+        logger.info(f"Source: {row['Source']}")
+        logger.info(f"Reference: {row['Reference']}")
+        logger.info(f"Transformer: {row['Transformer']}")
+        logger.info(f"LSTM: {row['LSTM']}")
 
 
-def visualize_comparison(comparison_df, output_path=None):
+def evaluate_and_compare(config):
     """
-    Trực quan hóa kết quả so sánh
-    
-    Args:
-        comparison_df (pd.DataFrame): DataFrame chứa kết quả so sánh
-        output_path (str, optional): Đường dẫn để lưu biểu đồ
-    """
-    # Tạo figure với 2 subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Plot phân phối BLEU score
-    sns.histplot(comparison_df['Transformer BLEU'], ax=ax1, label='Transformer', color='blue', alpha=0.6, kde=True)
-    sns.histplot(comparison_df['LSTM BLEU'], ax=ax1, label='LSTM', color='orange', alpha=0.6, kde=True)
-    ax1.set_xlabel('BLEU Score')
-    ax1.set_ylabel('Số lượng câu')
-    ax1.set_title('Phân phối BLEU Score')
-    ax1.legend()
-    
-    # Plot tỷ lệ mô hình tốt hơn
-    model_counts = comparison_df['Better Model'].value_counts()
-    ax2.pie(model_counts, labels=model_counts.index, autopct='%1.1f%%', colors=['blue', 'orange', 'green'])
-    ax2.set_title('Tỷ lệ mô hình tốt hơn')
-    
-    # Điều chỉnh layout
-    plt.tight_layout()
-    
-    # Lưu biểu đồ
-    if output_path:
-        plt.savefig(output_path)
-        logger.info(f"Đã lưu biểu đồ so sánh tại {output_path}")
-    else:
-        plt.show()
-
-
-def evaluate_on_custom_sentences(sentences, transformer_model, lstm_model, src_sp, tgt_sp, device):
-    """
-    Đánh giá mô hình trên các câu tùy chỉnh
-    
-    Args:
-        sentences (list): Danh sách câu cần dịch
-        transformer_model: Mô hình Transformer
-        lstm_model: Mô hình LSTM
-        src_sp: Tokenizer nguồn
-        tgt_sp: Tokenizer đích
-        device (str): Thiết bị (CPU/GPU)
-        
-    Returns:
-        pd.DataFrame: DataFrame chứa kết quả dịch
-    """
-    transformer_translations = []
-    lstm_translations = []
-    
-    for sentence in tqdm(sentences, desc="Dịch câu tùy chỉnh"):
-        # Dịch bằng Transformer
-        transformer_translation = translate_sentence(
-            sentence, transformer_model, src_sp, tgt_sp, 'transformer', device
-        )
-        
-        # Dịch bằng LSTM
-        lstm_translation = translate_sentence(
-            sentence, lstm_model, src_sp, tgt_sp, 'lstm', device
-        )
-        
-        transformer_translations.append(transformer_translation)
-        lstm_translations.append(lstm_translation)
-    
-    # Tạo DataFrame
-    results_df = pd.DataFrame({
-        'Source': sentences,
-        'Transformer': transformer_translations,
-        'LSTM': lstm_translations
-    })
-    
-    return results_df
-
-
-def main(config):
-    """
-    Hàm chính để đánh giá và so sánh mô hình
+    Đánh giá và so sánh hai mô hình
     
     Args:
         config (dict): Cấu hình
+    
+    Returns:
+        tuple: (transformer_bleu, lstm_bleu) - Điểm BLEU của hai mô hình
     """
-    # Tải mô hình Transformer
-    transformer_model, en_sp, vi_sp = load_model(
-        os.path.join(config['model_dir'], 'transformer_best.pt'),
-        'transformer',
-        config,
-        config['device']
-    )
+    # Tải tokenizer
+    with open(os.path.join(config['model_dir'], 'tokenizers.pkl'), 'rb') as f:
+        tokenizers = pickle.load(f)
     
-    # Tải mô hình LSTM
-    lstm_model, _, _ = load_model(
-        os.path.join(config['model_dir'], 'lstm_best.pt'),
-        'lstm',
-        config,
-        config['device']
-    )
+    en_sp = tokenizers['en_sp']
+    vi_sp = tokenizers['vi_sp']
     
-    # Đọc dữ liệu test
+    # Tải dữ liệu
     test_data = pd.read_csv(os.path.join(config['data_dir'], 'test_data.csv'))
     
-    # Đánh giá mô hình Transformer trên tập test
-    transformer_bleu, transformer_translations, references, src_sentences = evaluate_on_test_set(
-        transformer_model, test_data, en_sp, vi_sp, 'transformer', config['device'], num_samples=config['num_samples']
+    # Tạo DataLoader
+    _, _, test_loader = create_dataloaders(
+        None, None, test_data, en_sp, vi_sp, config
     )
     
-    # Đánh giá mô hình LSTM trên tập test
-    lstm_bleu, lstm_translations, _, _ = evaluate_on_test_set(
-        lstm_model, test_data, en_sp, vi_sp, 'lstm', config['device'], num_samples=config['num_samples']
-    )
+    # Xác định kích thước từ điển
+    src_vocab_size = en_sp.get_piece_size() if config['src_lang'] == 'en' else vi_sp.get_piece_size()
+    tgt_vocab_size = vi_sp.get_piece_size() if config['tgt_lang'] == 'vi' else en_sp.get_piece_size()
     
-    logger.info(f"BLEU score của mô hình Transformer: {transformer_bleu:.2f}")
-    logger.info(f"BLEU score của mô hình LSTM: {lstm_bleu:.2f}")
+    # Tải mô hình Transformer
+    transformer_path = os.path.join(config['model_dir'], "transformer_best.pt")
+    if os.path.exists(transformer_path):
+        transformer_model = load_model(transformer_path, 'transformer', config, src_vocab_size, tgt_vocab_size)
+        
+        # Đánh giá mô hình Transformer
+        logger.info("Đánh giá mô hình Transformer...")
+        transformer_bleu, transformer_examples = evaluate_model(
+            transformer_model, test_loader, tokenizers, config, model_type='transformer'
+        )
+        logger.info(f"Transformer BLEU: {transformer_bleu:.2f}")
+    else:
+        logger.warning(f"Không tìm thấy mô hình Transformer tại {transformer_path}")
+        transformer_bleu = 0
+        transformer_examples = []
+    
+    # Tải mô hình LSTM
+    lstm_path = os.path.join(config['model_dir'], "lstm_best.pt")
+    if os.path.exists(lstm_path):
+        lstm_model = load_model(lstm_path, 'lstm', config, src_vocab_size, tgt_vocab_size)
+        
+        # Đánh giá mô hình LSTM
+        logger.info("Đánh giá mô hình LSTM...")
+        lstm_bleu, lstm_examples = evaluate_model(
+            lstm_model, test_loader, tokenizers, config, model_type='lstm'
+        )
+        logger.info(f"LSTM BLEU: {lstm_bleu:.2f}")
+    else:
+        logger.warning(f"Không tìm thấy mô hình LSTM tại {lstm_path}")
+        lstm_bleu = 0
+        lstm_examples = []
     
     # So sánh kết quả dịch
-    comparison_df = compare_translations(
-        src_sentences, transformer_translations, lstm_translations, references,
-        output_path=os.path.join(config['model_dir'], 'translation_comparison.csv')
-    )
+    if transformer_examples and lstm_examples:
+        compare_translations(transformer_examples, lstm_examples, config)
     
-    # Trực quan hóa kết quả so sánh
-    visualize_comparison(
-        comparison_df,
-        output_path=os.path.join(config['model_dir'], 'translation_comparison.png')
-    )
+    # Vẽ biểu đồ so sánh BLEU
+    if transformer_bleu > 0 or lstm_bleu > 0:
+        plt.figure(figsize=(8, 6))
+        models = ['Transformer', 'LSTM']
+        bleu_scores = [transformer_bleu, lstm_bleu]
+        
+        sns.barplot(x=models, y=bleu_scores)
+        plt.title('BLEU Score Comparison')
+        plt.ylabel('BLEU Score')
+        plt.ylim(0, max(bleu_scores) * 1.2)
+        
+        # Thêm giá trị lên đầu cột
+        for i, score in enumerate(bleu_scores):
+            plt.text(i, score + 1, f"{score:.2f}", ha='center')
+        
+        # Lưu biểu đồ
+        plt.tight_layout()
+        plt.savefig(os.path.join(config['model_dir'], "bleu_comparison.png"))
+        plt.close()
     
-    # Đánh giá trên các câu tùy chỉnh
-    custom_sentences = [
-        "Hello, how are you?",
-        "I love learning new languages.",
-        "The weather is beautiful today.",
-        "Can you help me translate this document?",
-        "I will visit Vietnam next year.",
-        "This is a complex sentence with multiple clauses and technical terms.",
-        "Artificial intelligence is transforming the way we live and work.",
-        "Please send me the report by email as soon as possible.",
-        "The conference will be held in Hanoi from June 10 to June 15.",
-        "I don't understand what you're saying."
-    ]
-    
-    custom_results = evaluate_on_custom_sentences(
-        custom_sentences, transformer_model, lstm_model, en_sp, vi_sp, config['device']
-    )
-    
-    # Lưu kết quả
-    custom_results.to_csv(os.path.join(config['model_dir'], 'custom_translations.csv'), index=False)
-    logger.info(f"Đã lưu kết quả dịch câu tùy chỉnh tại {os.path.join(config['model_dir'], 'custom_translations.csv')}")
-    
-    # In kết quả
-    logger.info("\nKết quả dịch câu tùy chỉnh:")
-    print(tabulate(custom_results, headers='keys', tablefmt='grid'))
-    
-    # Tạo báo cáo tổng hợp
-    summary = {
-        'Model': ['Transformer', 'LSTM'],
-        'BLEU Score': [transformer_bleu, lstm_bleu],
-        'Better on Test Set (%)': [
-            comparison_df[comparison_df['Better Model'] == 'Transformer'].shape[0] / comparison_df.shape[0] * 100,
-            comparison_df[comparison_df['Better Model'] == 'LSTM'].shape[0] / comparison_df.shape[0] * 100
-        ]
-    }
-    
-    summary_df = pd.DataFrame(summary)
-    summary_df.to_csv(os.path.join(config['model_dir'], 'model_summary.csv'), index=False)
-    logger.info(f"Đã lưu báo cáo tổng hợp tại {os.path.join(config['model_dir'], 'model_summary.csv')}")
-    
-    # In báo cáo tổng hợp
-    logger.info("\nBáo cáo tổng hợp:")
-    print(tabulate(summary_df, headers='keys', tablefmt='grid'))
-    
-    # Xác định mô hình tốt nhất
-    best_model = 'Transformer' if transformer_bleu > lstm_bleu else 'LSTM'
-    logger.info(f"\nMô hình tốt nhất: {best_model}")
-    
-    return best_model, transformer_bleu, lstm_bleu
+    return transformer_bleu, lstm_bleu
 
 
 if __name__ == "__main__":
-    # Parse arguments
-    parser = argparse.ArgumentParser(description='Đánh giá và so sánh mô hình dịch máy')
-    parser.add_argument('--data_dir', type=str, default='./data', help='Thư mục dữ liệu')
-    parser.add_argument('--model_dir', type=str, default='./models', help='Thư mục mô hình')
-    parser.add_argument('--num_samples', type=int, default=100, help='Số lượng mẫu để đánh giá')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Thiết bị (CPU/GPU)')
-    parser.add_argument('--src_lang', type=str, default='en', help='Ngôn ngữ nguồn')
-    parser.add_argument('--tgt_lang', type=str, default='vi', help='Ngôn ngữ đích')
-    args = parser.parse_args()
-    
     # Cấu hình
     config = {
-        'data_dir': args.data_dir,
-        'model_dir': args.model_dir,
-        'num_samples': args.num_samples,
-        'device': args.device,
-        'src_lang': args.src_lang,
-        'tgt_lang': args.tgt_lang,
+        'data_dir': './data',
+        'model_dir': './models',
+        'src_lang': 'en',
+        'tgt_lang': 'vi',
+        'batch_size': 32,
+        'max_len': 128,
+        'num_workers': 2,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         
         'transformer': {
             'd_model': 512,
@@ -447,8 +306,7 @@ if __name__ == "__main__":
             'num_decoder_layers': 6,
             'd_ff': 2048,
             'dropout': 0.1,
-            'pad_idx': 0,
-            'label_smoothing': 0.1
+            'pad_idx': 0
         },
         
         'lstm': {
@@ -462,5 +320,13 @@ if __name__ == "__main__":
         }
     }
     
-    # Đánh giá và so sánh mô hình
-    best_model, transformer_bleu, lstm_bleu = main(config)
+    # Đánh giá và so sánh hai mô hình
+    transformer_bleu, lstm_bleu = evaluate_and_compare(config)
+    
+    # Kết luận
+    if transformer_bleu > lstm_bleu:
+        logger.info("\nKết luận: Mô hình Transformer có hiệu suất tốt hơn!")
+    elif lstm_bleu > transformer_bleu:
+        logger.info("\nKết luận: Mô hình LSTM có hiệu suất tốt hơn!")
+    else:
+        logger.info("\nKết luận: Hai mô hình có hiệu suất tương đương nhau.")

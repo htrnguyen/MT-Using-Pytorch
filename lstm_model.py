@@ -2,119 +2,106 @@
 # -*- coding: utf-8 -*-
 
 """
-Mô hình LSTM với Attention cho dịch máy Tiếng Việt - Tiếng Anh
+Mô hình dịch máy LSTM cho Tiếng Việt - Tiếng Anh
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import math
-import logging
+import random
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-
-# Thiết lập logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
 
 
 class Encoder(nn.Module):
     """
-    Encoder LSTM hai chiều
+    Encoder của mô hình LSTM Seq2Seq
     """
-    def __init__(self, vocab_size, embed_size, hidden_size, num_layers=2, dropout=0.3, bidirectional=True):
+    def __init__(self, vocab_size, embed_size, hidden_size, num_layers, dropout, bidirectional, pad_idx):
         """
         Khởi tạo Encoder
         
         Args:
-            vocab_size (int): Kích thước từ điển nguồn
+            vocab_size (int): Kích thước từ điển
             embed_size (int): Kích thước embedding
             hidden_size (int): Kích thước hidden state
-            num_layers (int): Số lớp LSTM
+            num_layers (int): Số lượng lớp LSTM
             dropout (float): Tỷ lệ dropout
-            bidirectional (bool): Có sử dụng LSTM hai chiều không
+            bidirectional (bool): Có sử dụng LSTM hai chiều hay không
+            pad_idx (int): Chỉ số của token padding
         """
         super(Encoder, self).__init__()
-        self.vocab_size = vocab_size
-        self.embed_size = embed_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
+        self.dropout_rate = dropout
         
         # Embedding layer
-        self.embedding = nn.Embedding(vocab_size, embed_size, padding_idx=0)
+        self.embedding = nn.Embedding(vocab_size, embed_size, padding_idx=pad_idx)
         
         # LSTM layer
         self.lstm = nn.LSTM(
             input_size=embed_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            batch_first=True,
             dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
+            bidirectional=bidirectional,
+            batch_first=True
         )
         
-        # Projection layer nếu sử dụng LSTM hai chiều
-        if bidirectional:
-            self.projection = nn.Linear(hidden_size * 2, hidden_size)
+        # Dropout layer
+        self.dropout = nn.Dropout(dropout)
         
     def forward(self, src, src_lengths):
         """
         Args:
-            src (Tensor): Source tensor [batch_size, src_len]
-            src_lengths (Tensor): Độ dài thực của các câu [batch_size]
-            
+            src: Tensor shape [batch_size, src_len]
+            src_lengths: Tensor shape [batch_size]
+        
         Returns:
-            tuple: (outputs, hidden, cell)
-                - outputs: Tensor [batch_size, src_len, hidden_size * num_directions]
-                - hidden: Tensor [num_layers * num_directions, batch_size, hidden_size]
-                - cell: Tensor [num_layers * num_directions, batch_size, hidden_size]
+            outputs: Tensor shape [batch_size, src_len, hidden_size * num_directions]
+            hidden: Tuple of (h_n, c_n) với shape [num_layers * num_directions, batch_size, hidden_size]
         """
         # Embedding
-        embedded = self.embedding(src)  # [batch_size, src_len, embed_size]
+        embedded = self.dropout(self.embedding(src))
         
-        # Pack sequence để tối ưu tính toán
+        # Pack padded sequence
         packed = pack_padded_sequence(embedded, src_lengths.cpu(), batch_first=True, enforce_sorted=False)
         
         # LSTM
-        outputs, (hidden, cell) = self.lstm(packed)
+        outputs, hidden = self.lstm(packed)
         
         # Unpack sequence
-        outputs, _ = pad_packed_sequence(outputs, batch_first=True)  # [batch_size, src_len, hidden_size * num_directions]
+        outputs, _ = pad_packed_sequence(outputs, batch_first=True)
         
-        # Xử lý hidden state và cell state cho decoder
+        # Xử lý hidden state nếu là LSTM hai chiều
         if self.bidirectional:
-            # Gộp hidden state từ hai chiều
-            hidden = self._reshape_hidden(hidden)
-            cell = self._reshape_hidden(cell)
+            # Kết hợp hidden state từ hai chiều
+            h_n, c_n = hidden
+            h_n = self._combine_bidirectional(h_n)
+            c_n = self._combine_bidirectional(c_n)
+            hidden = (h_n, c_n)
         
-        return outputs, hidden, cell
+        return outputs, hidden
     
-    def _reshape_hidden(self, hidden):
+    def _combine_bidirectional(self, hidden):
         """
-        Reshape hidden state từ LSTM hai chiều
+        Kết hợp hidden state từ hai chiều
         
         Args:
-            hidden (Tensor): Hidden state [num_layers * num_directions, batch_size, hidden_size]
-            
+            hidden: Tensor shape [num_layers * num_directions, batch_size, hidden_size]
+        
         Returns:
-            Tensor: Reshaped hidden state [num_layers, batch_size, hidden_size]
+            Tensor shape [num_layers, batch_size, hidden_size * num_directions]
         """
-        batch_size = hidden.size(1)
+        num_layers = self.num_layers
+        batch_size = hidden.shape[1]
+        hidden_size = self.hidden_size
         
-        # Reshape và gộp các chiều
-        hidden = hidden.view(self.num_layers, self.num_directions, batch_size, self.hidden_size)
+        # Tách hidden state theo chiều
+        hidden = hidden.view(num_layers, 2, batch_size, hidden_size)
         
-        # Gộp forward và backward
-        hidden = torch.cat([hidden[:, 0, :, :], hidden[:, 1, :, :]], dim=2)
-        
-        # Project về kích thước hidden_size
-        hidden = self.projection(hidden.view(-1, self.hidden_size * 2)).view(self.num_layers, batch_size, self.hidden_size)
+        # Kết hợp hidden state từ hai chiều
+        hidden = torch.cat([hidden[:, 0], hidden[:, 1]], dim=2)
         
         return hidden
 
@@ -123,342 +110,274 @@ class Attention(nn.Module):
     """
     Cơ chế Attention cho Decoder
     """
-    def __init__(self, enc_hidden_size, dec_hidden_size, attn_size=None):
+    def __init__(self, enc_hidden_size, dec_hidden_size, bidirectional=True):
         """
         Khởi tạo Attention
         
         Args:
-            enc_hidden_size (int): Kích thước hidden state của encoder
-            dec_hidden_size (int): Kích thước hidden state của decoder
-            attn_size (int, optional): Kích thước attention, mặc định bằng dec_hidden_size
+            enc_hidden_size (int): Kích thước hidden state của Encoder
+            dec_hidden_size (int): Kích thước hidden state của Decoder
+            bidirectional (bool): Có sử dụng LSTM hai chiều hay không
         """
         super(Attention, self).__init__()
         
-        self.attn_size = attn_size if attn_size else dec_hidden_size
+        # Kích thước hidden state của Encoder sau khi kết hợp hai chiều
+        self.enc_hidden_size = enc_hidden_size * 2 if bidirectional else enc_hidden_size
+        self.dec_hidden_size = dec_hidden_size
         
-        # Projection layers
-        self.enc_projection = nn.Linear(enc_hidden_size, self.attn_size, bias=False)
-        self.dec_projection = nn.Linear(dec_hidden_size, self.attn_size, bias=False)
-        self.out = nn.Linear(self.attn_size, 1, bias=False)
+        # Layer tính attention score
+        self.attn = nn.Linear(self.enc_hidden_size + dec_hidden_size, dec_hidden_size)
+        self.v = nn.Linear(dec_hidden_size, 1, bias=False)
         
-    def forward(self, decoder_hidden, encoder_outputs, src_mask=None):
+    def forward(self, hidden, encoder_outputs, mask=None):
         """
         Args:
-            decoder_hidden (Tensor): Hidden state của decoder [batch_size, dec_hidden_size]
-            encoder_outputs (Tensor): Outputs của encoder [batch_size, src_len, enc_hidden_size]
-            src_mask (Tensor, optional): Mask cho source sequence [batch_size, src_len]
-            
+            hidden: Tensor shape [batch_size, dec_hidden_size]
+            encoder_outputs: Tensor shape [batch_size, src_len, enc_hidden_size]
+            mask: Tensor shape [batch_size, src_len]
+        
         Returns:
-            tuple: (attention_weights, context_vector)
-                - attention_weights: Tensor [batch_size, src_len]
-                - context_vector: Tensor [batch_size, enc_hidden_size]
+            attention: Tensor shape [batch_size, src_len]
+            context: Tensor shape [batch_size, enc_hidden_size]
         """
-        src_len = encoder_outputs.size(1)
-        batch_size = encoder_outputs.size(0)
+        batch_size = encoder_outputs.shape[0]
+        src_len = encoder_outputs.shape[1]
         
-        # Reshape decoder hidden để tính attention
-        decoder_hidden = decoder_hidden.unsqueeze(1).repeat(1, src_len, 1)  # [batch_size, src_len, dec_hidden_size]
+        # Lặp lại hidden state để kết hợp với từng encoder output
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)
         
-        # Project encoder outputs và decoder hidden
-        enc_proj = self.enc_projection(encoder_outputs)  # [batch_size, src_len, attn_size]
-        dec_proj = self.dec_projection(decoder_hidden)   # [batch_size, src_len, attn_size]
+        # Kết hợp hidden state và encoder outputs
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
         
-        # Tính energy
-        energy = torch.tanh(enc_proj + dec_proj)  # [batch_size, src_len, attn_size]
-        energy = self.out(energy).squeeze(2)      # [batch_size, src_len]
+        # Tính attention score
+        attention = self.v(energy).squeeze(2)
         
         # Áp dụng mask nếu có
-        if src_mask is not None:
-            energy = energy.masked_fill(src_mask == 0, -1e10)
+        if mask is not None:
+            attention = attention.masked_fill(mask == 0, -1e10)
         
-        # Tính attention weights
-        attention_weights = F.softmax(energy, dim=1)  # [batch_size, src_len]
+        # Áp dụng softmax để có attention weights
+        attention = F.softmax(attention, dim=1)
         
         # Tính context vector
-        context_vector = torch.bmm(attention_weights.unsqueeze(1), encoder_outputs).squeeze(1)  # [batch_size, enc_hidden_size]
+        context = torch.bmm(attention.unsqueeze(1), encoder_outputs).squeeze(1)
         
-        return attention_weights, context_vector
+        return attention, context
 
 
 class Decoder(nn.Module):
     """
-    Decoder LSTM với Attention
+    Decoder của mô hình LSTM Seq2Seq với Attention
     """
-    def __init__(self, vocab_size, embed_size, hidden_size, enc_hidden_size=None, num_layers=2, dropout=0.3):
+    def __init__(self, vocab_size, embed_size, enc_hidden_size, dec_hidden_size, 
+                 num_layers, dropout, bidirectional_encoder, pad_idx):
         """
         Khởi tạo Decoder
         
         Args:
-            vocab_size (int): Kích thước từ điển đích
+            vocab_size (int): Kích thước từ điển
             embed_size (int): Kích thước embedding
-            hidden_size (int): Kích thước hidden state
-            enc_hidden_size (int, optional): Kích thước hidden state của encoder, mặc định bằng hidden_size
-            num_layers (int): Số lớp LSTM
+            enc_hidden_size (int): Kích thước hidden state của Encoder
+            dec_hidden_size (int): Kích thước hidden state của Decoder
+            num_layers (int): Số lượng lớp LSTM
             dropout (float): Tỷ lệ dropout
+            bidirectional_encoder (bool): Encoder có sử dụng LSTM hai chiều hay không
+            pad_idx (int): Chỉ số của token padding
         """
         super(Decoder, self).__init__()
         
         self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
+        self.dec_hidden_size = dec_hidden_size
         self.num_layers = num_layers
-        self.enc_hidden_size = enc_hidden_size if enc_hidden_size else hidden_size
+        self.dropout_rate = dropout
+        
+        # Kích thước hidden state của Encoder sau khi kết hợp hai chiều
+        self.enc_hidden_size = enc_hidden_size * 2 if bidirectional_encoder else enc_hidden_size
         
         # Embedding layer
-        self.embedding = nn.Embedding(vocab_size, embed_size, padding_idx=0)
+        self.embedding = nn.Embedding(vocab_size, embed_size, padding_idx=pad_idx)
         
         # Attention
-        self.attention = Attention(self.enc_hidden_size, hidden_size)
+        self.attention = Attention(enc_hidden_size, dec_hidden_size, bidirectional_encoder)
         
         # LSTM layer
         self.lstm = nn.LSTM(
-            input_size=embed_size + self.enc_hidden_size,  # Concatenate embedding và context vector
-            hidden_size=hidden_size,
+            input_size=embed_size + self.enc_hidden_size,
+            hidden_size=dec_hidden_size,
             num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True
         )
         
         # Output layer
-        self.output_layer = nn.Linear(hidden_size + self.enc_hidden_size + embed_size, vocab_size)
+        self.fc_out = nn.Linear(dec_hidden_size + self.enc_hidden_size + embed_size, vocab_size)
         
-        # Dropout
+        # Dropout layer
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, tgt, prev_hidden, prev_cell, encoder_outputs, src_mask=None):
+    def forward(self, input, hidden, encoder_outputs, mask=None):
         """
         Args:
-            tgt (Tensor): Target tensor [batch_size, 1]
-            prev_hidden (Tensor): Previous hidden state [num_layers, batch_size, hidden_size]
-            prev_cell (Tensor): Previous cell state [num_layers, batch_size, hidden_size]
-            encoder_outputs (Tensor): Outputs của encoder [batch_size, src_len, enc_hidden_size]
-            src_mask (Tensor, optional): Mask cho source sequence [batch_size, src_len]
-            
+            input: Tensor shape [batch_size, 1]
+            hidden: Tuple of (h_n, c_n) với shape [num_layers, batch_size, dec_hidden_size]
+            encoder_outputs: Tensor shape [batch_size, src_len, enc_hidden_size]
+            mask: Tensor shape [batch_size, src_len]
+        
         Returns:
-            tuple: (output, hidden, cell, attention_weights)
-                - output: Tensor [batch_size, vocab_size]
-                - hidden: Tensor [num_layers, batch_size, hidden_size]
-                - cell: Tensor [num_layers, batch_size, hidden_size]
-                - attention_weights: Tensor [batch_size, src_len]
+            output: Tensor shape [batch_size, vocab_size]
+            hidden: Tuple of (h_n, c_n) với shape [num_layers, batch_size, dec_hidden_size]
+            attention: Tensor shape [batch_size, src_len]
         """
         # Embedding
-        embedded = self.dropout(self.embedding(tgt))  # [batch_size, 1, embed_size]
+        embedded = self.dropout(self.embedding(input))
         
-        # Tính attention
-        attention_weights, context_vector = self.attention(prev_hidden[-1], encoder_outputs, src_mask)
+        # Tính attention và context vector
+        h_n, c_n = hidden
+        attention, context = self.attention(h_n[-1], encoder_outputs, mask)
         
-        # Concatenate embedding và context vector
-        lstm_input = torch.cat((embedded, context_vector.unsqueeze(1)), dim=2)  # [batch_size, 1, embed_size + enc_hidden_size]
+        # Kết hợp embedded và context vector
+        lstm_input = torch.cat((embedded, context.unsqueeze(1)), dim=2)
         
         # LSTM
-        output, (hidden, cell) = self.lstm(lstm_input, (prev_hidden, prev_cell))
+        output, hidden = self.lstm(lstm_input, hidden)
         
-        # Concatenate output, context vector và embedding cho output layer
-        output = torch.cat((output.squeeze(1), context_vector, embedded.squeeze(1)), dim=1)
+        # Kết hợp output, context và embedded để dự đoán
+        output = output.squeeze(1)
+        embedded = embedded.squeeze(1)
+        context = context
         
-        # Output layer
-        output = self.output_layer(output)  # [batch_size, vocab_size]
+        output = self.fc_out(torch.cat((output, context, embedded), dim=1))
         
-        return output, hidden, cell, attention_weights
+        return output, hidden, attention
 
 
 class LSTMSeq2Seq(nn.Module):
     """
-    Mô hình LSTM Sequence-to-Sequence với Attention
+    Mô hình LSTM Seq2Seq đầy đủ với Attention
     """
-    def __init__(self, src_vocab_size, tgt_vocab_size, embed_size=256, hidden_size=512, 
-                 enc_num_layers=2, dec_num_layers=2, dropout=0.3, bidirectional=True, pad_idx=0):
+    def __init__(self, encoder, decoder, device):
         """
         Khởi tạo mô hình LSTM Seq2Seq
         
         Args:
-            src_vocab_size (int): Kích thước từ điển nguồn
-            tgt_vocab_size (int): Kích thước từ điển đích
-            embed_size (int): Kích thước embedding
-            hidden_size (int): Kích thước hidden state
-            enc_num_layers (int): Số lớp LSTM trong encoder
-            dec_num_layers (int): Số lớp LSTM trong decoder
-            dropout (float): Tỷ lệ dropout
-            bidirectional (bool): Có sử dụng LSTM hai chiều trong encoder không
-            pad_idx (int): Chỉ số của token padding
+            encoder (Encoder): Encoder
+            decoder (Decoder): Decoder
+            device (str): Thiết bị (CPU/GPU)
         """
         super(LSTMSeq2Seq, self).__init__()
         
-        self.pad_idx = pad_idx
-        self.hidden_size = hidden_size
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
         
-        # Encoder
-        self.encoder = Encoder(
-            vocab_size=src_vocab_size,
-            embed_size=embed_size,
-            hidden_size=hidden_size,
-            num_layers=enc_num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
-        
-        # Decoder
-        self.decoder = Decoder(
-            vocab_size=tgt_vocab_size,
-            embed_size=embed_size,
-            hidden_size=hidden_size,
-            enc_hidden_size=hidden_size * (2 if bidirectional else 1),
-            num_layers=dec_num_layers,
-            dropout=dropout
-        )
-        
-        # Criterion
-        self.criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
-        
-    def forward(self, src, tgt, src_lengths, teacher_forcing_ratio=0.5):
+    def forward(self, src, src_lengths, tgt, teacher_forcing_ratio=0.5):
         """
         Args:
-            src (Tensor): Source tensor [batch_size, src_len]
-            tgt (Tensor): Target tensor [batch_size, tgt_len]
-            src_lengths (Tensor): Độ dài thực của các câu nguồn [batch_size]
+            src: Tensor shape [batch_size, src_len]
+            src_lengths: Tensor shape [batch_size]
+            tgt: Tensor shape [batch_size, tgt_len]
             teacher_forcing_ratio (float): Tỷ lệ sử dụng teacher forcing
-            
+        
         Returns:
-            tuple: (outputs, attention_weights)
-                - outputs: Tensor [batch_size, tgt_len, vocab_size]
-                - attention_weights: Tensor [batch_size, tgt_len, src_len]
+            outputs: Tensor shape [batch_size, tgt_len, vocab_size]
         """
-        batch_size = src.size(0)
-        tgt_len = tgt.size(1)
+        batch_size = src.shape[0]
+        tgt_len = tgt.shape[1]
         tgt_vocab_size = self.decoder.vocab_size
         
-        # Tensor để lưu outputs
-        outputs = torch.zeros(batch_size, tgt_len, tgt_vocab_size).to(src.device)
-        attention_weights = torch.zeros(batch_size, tgt_len, src.size(1)).to(src.device)
-        
-        # Tạo mask cho source sequence
-        src_mask = (src != self.pad_idx).to(src.device)  # [batch_size, src_len]
+        # Tensor để lưu kết quả
+        outputs = torch.zeros(batch_size, tgt_len, tgt_vocab_size).to(self.device)
         
         # Encoder
-        encoder_outputs, hidden, cell = self.encoder(src, src_lengths)
+        encoder_outputs, hidden = self.encoder(src, src_lengths)
         
-        # Decoder - bắt đầu với token đầu tiên
-        input = tgt[:, 0].unsqueeze(1)  # [batch_size, 1]
+        # Tạo mask cho source padding
+        mask = (src != 0).to(self.device)
+        
+        # Bắt đầu với token BOS
+        input = tgt[:, 0].unsqueeze(1)
         
         for t in range(1, tgt_len):
-            # Decoder step
-            output, hidden, cell, attn_weights = self.decoder(
-                input, hidden, cell, encoder_outputs, src_mask
-            )
+            # Decoder
+            output, hidden, _ = self.decoder(input, hidden, encoder_outputs, mask)
             
-            # Lưu output và attention weights
+            # Lưu kết quả
             outputs[:, t, :] = output
-            attention_weights[:, t, :] = attn_weights
             
-            # Teacher forcing
-            teacher_force = torch.rand(1).item() < teacher_forcing_ratio
+            # Quyết định sử dụng teacher forcing hay không
+            teacher_force = random.random() < teacher_forcing_ratio
             
-            # Lấy token tiếp theo (từ ground truth hoặc từ prediction)
+            # Lấy token có xác suất cao nhất
             top1 = output.argmax(1)
+            
+            # Chuẩn bị input cho bước tiếp theo
             input = tgt[:, t].unsqueeze(1) if teacher_force else top1.unsqueeze(1)
         
-        return outputs, attention_weights
+        return outputs
     
-    def calculate_loss(self, outputs, target):
+    def translate(self, src, src_lengths, tgt_sp, max_len=100, device='cuda'):
         """
-        Tính loss
+        Dịch một câu
         
         Args:
-            outputs (Tensor): Output tensor [batch_size, tgt_len, vocab_size]
-            target (Tensor): Target tensor [batch_size, tgt_len]
-            
-        Returns:
-            Tensor: Loss
-        """
-        # Bỏ qua token đầu tiên (BOS)
-        outputs = outputs[:, 1:, :].contiguous().view(-1, outputs.size(2))
-        target = target[:, 1:].contiguous().view(-1)
-        
-        return self.criterion(outputs, target)
-    
-    def translate(self, src, src_lengths, tgt_sp, max_len=100, device=None):
-        """
-        Dịch một câu từ ngôn ngữ nguồn sang ngôn ngữ đích
-        
-        Args:
-            src (Tensor): Source tensor [batch_size, src_len]
-            src_lengths (Tensor): Độ dài thực của các câu nguồn [batch_size]
+            src: Tensor shape [batch_size, src_len]
+            src_lengths: Tensor shape [batch_size]
             tgt_sp: Tokenizer đích
             max_len (int): Độ dài tối đa của câu dịch
-            device: Thiết bị (CPU/GPU)
-            
+            device (str): Thiết bị (CPU/GPU)
+        
         Returns:
-            tuple: (translations, attention_weights)
-                - translations: List[str] - Danh sách các câu dịch
-                - attention_weights: Tensor [batch_size, max_len, src_len]
+            translations (list): Danh sách các câu đã dịch
+            attention_weights (list): Danh sách các attention weights
         """
-        if device is None:
-            device = src.device
-            
-        batch_size = src.size(0)
-        
-        # Tensor để lưu attention weights
-        attention_weights = torch.zeros(batch_size, max_len, src.size(1)).to(device)
-        
-        # Tạo mask cho source sequence
-        src_mask = (src != self.pad_idx).to(device)  # [batch_size, src_len]
+        batch_size = src.shape[0]
         
         # Encoder
         with torch.no_grad():
-            encoder_outputs, hidden, cell = self.encoder(src, src_lengths)
+            encoder_outputs, hidden = self.encoder(src, src_lengths)
+        
+        # Tạo mask cho source padding
+        mask = (src != 0).to(device)
         
         # Bắt đầu với token BOS
-        input = torch.tensor([[tgt_sp.bos_id()]] * batch_size).to(device)
+        input = torch.tensor([tgt_sp.bos_id()] * batch_size).unsqueeze(1).to(device)
         
-        # Lưu các token đã dịch
-        translated_tokens = torch.zeros(batch_size, max_len).long().to(device)
-        translated_tokens[:, 0] = tgt_sp.bos_id()
+        translations = [''] * batch_size
+        attention_weights = [[] for _ in range(batch_size)]
         
-        # Dịch từng token
-        for t in range(1, max_len):
-            # Decoder step
+        for t in range(max_len):
             with torch.no_grad():
-                output, hidden, cell, attn_weights = self.decoder(
-                    input, hidden, cell, encoder_outputs, src_mask
-                )
-            
-            # Lưu attention weights
-            attention_weights[:, t, :] = attn_weights
+                output, hidden, attention = self.decoder(input, hidden, encoder_outputs, mask)
             
             # Lấy token có xác suất cao nhất
             pred_token = output.argmax(1)
-            translated_tokens[:, t] = pred_token
             
-            # Cập nhật input cho bước tiếp theo
-            input = pred_token.unsqueeze(1)
+            # Lưu attention weights
+            for i in range(batch_size):
+                attention_weights[i].append(attention[i].cpu().numpy())
             
-            # Kiểm tra nếu tất cả các câu đã kết thúc
-            if (pred_token == tgt_sp.eos_id()).all():
+            # Cập nhật translations
+            for i in range(batch_size):
+                token = pred_token[i].item()
+                if token == tgt_sp.eos_id():
+                    continue
+                if translations[i] == '':
+                    translations[i] = tgt_sp.id_to_piece(token)
+                else:
+                    translations[i] += tgt_sp.id_to_piece(token).replace('▁', ' ')
+            
+            # Kiểm tra nếu tất cả các câu đều kết thúc
+            if all(pred_token.eq(tgt_sp.eos_id())):
                 break
+            
+            # Chuẩn bị input cho bước tiếp theo
+            input = pred_token.unsqueeze(1)
         
-        # Chuyển từ tokens sang câu
-        translations = []
+        # Xử lý kết quả
         for i in range(batch_size):
-            tokens = translated_tokens[i, :].tolist()
-            
-            # Tìm vị trí của token EOS đầu tiên
-            if tgt_sp.eos_id() in tokens:
-                eos_idx = tokens.index(tgt_sp.eos_id())
-                tokens = tokens[1:eos_idx]  # Bỏ token BOS và EOS
-            else:
-                tokens = tokens[1:]  # Chỉ bỏ token BOS
-            
-            translations.append(tgt_sp.decode(tokens))
+            translations[i] = translations[i].replace(' ', '')
         
         return translations, attention_weights
-    
-    def count_parameters(self):
-        """
-        Đếm số lượng tham số của mô hình
-        
-        Returns:
-            int: Số lượng tham số
-        """
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 def create_lstm_model(config, src_vocab_size, tgt_vocab_size):
@@ -469,39 +388,40 @@ def create_lstm_model(config, src_vocab_size, tgt_vocab_size):
         config (dict): Cấu hình mô hình
         src_vocab_size (int): Kích thước từ điển nguồn
         tgt_vocab_size (int): Kích thước từ điển đích
-        
+    
     Returns:
         LSTMSeq2Seq: Mô hình LSTM Seq2Seq
     """
-    model = LSTMSeq2Seq(
-        src_vocab_size=src_vocab_size,
-        tgt_vocab_size=tgt_vocab_size,
+    # Tạo Encoder
+    encoder = Encoder(
+        vocab_size=src_vocab_size,
         embed_size=config['embed_size'],
         hidden_size=config['hidden_size'],
-        enc_num_layers=config['enc_num_layers'],
-        dec_num_layers=config['dec_num_layers'],
+        num_layers=config['enc_num_layers'],
         dropout=config['dropout'],
         bidirectional=config['bidirectional'],
         pad_idx=config['pad_idx']
     )
     
-    logger.info(f"Đã tạo mô hình LSTM Seq2Seq với {model.count_parameters():,} tham số")
-    
-    return model
-
-
-if __name__ == "__main__":
-    # Cấu hình mặc định
-    config = {
-        'embed_size': 256,
-        'hidden_size': 512,
-        'enc_num_layers': 2,
-        'dec_num_layers': 2,
-        'dropout': 0.3,
-        'bidirectional': True,
-        'pad_idx': 0
-    }
+    # Tạo Decoder
+    decoder = Decoder(
+        vocab_size=tgt_vocab_size,
+        embed_size=config['embed_size'],
+        enc_hidden_size=config['hidden_size'],
+        dec_hidden_size=config['hidden_size'],
+        num_layers=config['dec_num_layers'],
+        dropout=config['dropout'],
+        bidirectional_encoder=config['bidirectional'],
+        pad_idx=config['pad_idx']
+    )
     
     # Tạo mô hình
-    model = create_lstm_model(config, src_vocab_size=8000, tgt_vocab_size=8000)
-    logger.info(f"Số lượng tham số: {model.count_parameters():,}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = LSTMSeq2Seq(encoder, decoder, device)
+    
+    # Khởi tạo trọng số
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)
+    
+    return model
