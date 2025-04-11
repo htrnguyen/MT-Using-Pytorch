@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Script chính để chạy huấn luyện và đánh giá mô hình dịch máy Tiếng Việt - Tiếng Anh
+Script chính để chạy huấn luyện và đánh giá mô hình dịch máy Tiếng Việt - Tiếng Anh trên Kaggle
 """
 
 import os
 import argparse
 import torch
 import logging
+import shutil
 
 # Thiết lập logging
 logging.basicConfig(
@@ -27,8 +28,8 @@ def main():
     parser = argparse.ArgumentParser(description='Huấn luyện và đánh giá mô hình dịch máy Tiếng Việt - Tiếng Anh')
     parser.add_argument('--mode', type=str, choices=['preprocess', 'train', 'evaluate', 'all'], default='all',
                         help='Chế độ chạy: preprocess, train, evaluate hoặc all')
-    parser.add_argument('--data_dir', type=str, default='/kaggle/working/data', help='Thư mục dữ liệu')
-    parser.add_argument('--model_dir', type=str, default='/kaggle/working/models', help='Thư mục mô hình')
+    parser.add_argument('--data_dir', type=str, default='./data', help='Thư mục dữ liệu')
+    parser.add_argument('--model_dir', type=str, default='./models', help='Thư mục mô hình')
     parser.add_argument('--src_lang', type=str, default='en', help='Ngôn ngữ nguồn')
     parser.add_argument('--tgt_lang', type=str, default='vi', help='Ngôn ngữ đích')
     parser.add_argument('--batch_size', type=int, default=32, help='Kích thước batch')
@@ -41,7 +42,20 @@ def main():
     parser.add_argument('--num_workers', type=int, default=2, help='Số worker cho DataLoader')
     parser.add_argument('--mixed_precision', action='store_true', help='Sử dụng mixed precision')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='Số bước tích lũy gradient')
+    parser.add_argument('--prepare_data', action='store_true', help='Chuẩn bị dữ liệu từ dataset')
     args = parser.parse_args()
+    
+    # Chuẩn bị dữ liệu từ dataset nếu cần
+    if args.prepare_data:
+        logger.info("Chuẩn bị dữ liệu từ dataset...")
+        os.makedirs(args.data_dir, exist_ok=True)
+        try:
+            shutil.copy('/kaggle/input/eng-viet/eng_vie.csv', os.path.join(args.data_dir, 'eng_vie.csv'))
+            shutil.copy('/kaggle/input/eng-viet/vie.txt', os.path.join(args.data_dir, 'vie.txt'))
+            logger.info("Đã sao chép dữ liệu từ dataset vào thư mục làm việc")
+        except Exception as e:
+            logger.error(f"Lỗi khi sao chép dữ liệu: {e}")
+            logger.info("Vui lòng đảm bảo dataset 'eng-viet' đã được thêm vào notebook")
     
     # Tạo thư mục
     os.makedirs(args.data_dir, exist_ok=True)
@@ -117,8 +131,16 @@ def main():
         preprocessor = DataPreprocessor(preprocessor_config)
         
         # Đường dẫn file dữ liệu
-        file1_path = '/kaggle/input/eng-viet/eng_vie.csv'
-        file2_path = '/kaggle/input/eng-viet/vie.txt'
+        file1_path = os.path.join(args.data_dir, 'eng_vie.csv')
+        file2_path = os.path.join(args.data_dir, 'vie.txt')
+        
+        # Kiểm tra xem file dữ liệu có tồn tại không
+        if not os.path.exists(file1_path) or not os.path.exists(file2_path):
+            logger.error(f"Không tìm thấy file dữ liệu. Vui lòng đảm bảo các file sau tồn tại:")
+            logger.error(f"- {file1_path}")
+            logger.error(f"- {file2_path}")
+            logger.info("Bạn có thể chạy lại với tham số --prepare_data để sao chép dữ liệu từ dataset")
+            return
         
         # Tiền xử lý dữ liệu
         train_data, val_data, test_data, en_sp, vi_sp = preprocessor.process(file1_path, file2_path)
